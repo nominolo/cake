@@ -433,7 +433,7 @@ checkOne env goal_ = do
    -- If the Todo requires action, we immediately change the current
    -- state of the item in the database, so that other workers will
    -- wait for us.
-   grabTodo :: CanonicalFilePath -> IO BuildTodo2
+   grabTodo :: CanonicalFilePath -> IO BuildTodo
    grabTodo goal = do
      modifyMVar (aeDatabase env) $ \db@(DB mdb) ->
        case M.lookup goal mdb of
@@ -546,7 +546,7 @@ selectorFunctions = map nth [0..]
   where nth n xs = xs !! n
 
 -- | Describes what we should do with the target.
-data BuildTodo2
+data BuildTodo
   = Rebuild Reason ([ModTime] -> IO ())
             [CanonicalFilePath] (Maybe [ModTime])
             (ActEnv -> IO (History, [ModTime]))
