@@ -1,11 +1,11 @@
 {-# LANGUAGE DeriveDataTypeable, BangPatterns #-}
+{-# OPTIONS_GHC -Wall -fno-warn-orphans #-}
 module Development.Cake.Core where
 
 import Control.Applicative
 import Control.Concurrent.MVar
 import Control.DeepSeq
-import Control.Exception as Exception
-import Control.Exception.Base
+import Control.Exception as Exception hiding ( unblock )
 import Control.Monad
 import Control.Monad.IO.Class
 import Control.Concurrent.ParallelIO.Local
@@ -148,7 +148,7 @@ data ActState = ActState
   { asHistory :: History }
 
 appendHistory :: QA -> Act ()
-appendHistory qa = Act (\env mst ->
+appendHistory qa = Act (\_env mst ->
   modifyMVar_ mst $ \st ->
     let H hist = asHistory st in
     return st{ asHistory = H (hist ++ [qa]) })
@@ -211,11 +211,14 @@ instance Show CakefileException where
 showCakefileException :: CakefileException -> [String]
 showCakefileException (RuleError s) =
   ["Error in rule definition: " ++ s]
+showCakefileException (RecursiveError _) =
+  ["Error in recursive invokation"]
 
 instance Exception.Exception CakefileException
 
 instance NFData CakefileException where
     rnf (RuleError a) = rnf a
+    rnf (RecursiveError ls) = rnf ls
 
 type CakeSuccess a = Either CakefileException a
 
@@ -248,8 +251,8 @@ findRule env ruleSet goal = do
       case mb_dflt of
         Nothing -> cakefileError $ "No rule to build " ++ show goal
         Just (outs, act) ->
-          return (outs, \e -> do modtimes <- liftIO act
-                                 return (H [], modtimes))
+          return (outs, \_env -> do modtimes <- liftIO act
+                                    return (H [], modtimes))
     [gen] -> do
       report' env chatty $
         "RULE " ++ show goal ++ ": outputs: " ++ show (genOutputs gen)
@@ -260,7 +263,7 @@ findRule env ruleSet goal = do
         ": choosing first one."
       return (genOutputs gen, \e -> runAct e (genAction gen))
  where
-   tryToMatch goal rule = rule goal
+   tryToMatch gl rule = rule gl
 
 defaultRule :: ActEnv -> CanonicalFilePath
             -> IO (Maybe ([CanonicalFilePath], IO [ModTime]))
@@ -290,7 +293,7 @@ runAct env (Act act) = do
   st <- readMVar mst
   return (asHistory st, res)
 
--- | Check whether the given targets are up to date.
+-- Check whether the given targets are up to date.
 -- 
 -- TODO: There are two ways to handle this:
 -- 
@@ -322,10 +325,6 @@ runAct env (Act act) = do
 --     managment to the Haskell thread scheduler as well.
 -- 
 
---checkHistory :: ActEnv -> [CanonicalFilePath] -> History
---             -> IO (Bool, [ModTime])
---checkHistory env goals  = do
-
 type NeedsRebuilding = Bool
 
 -- | Check a single history entry.
@@ -343,7 +342,7 @@ checkQA env (Need entries) = do
     show oks
   return (not (and oks))
  where
-   check goal new_time old_time = old_time == new_time
+   check _goal new_time old_time = old_time == new_time
 
 checkHistory :: ActEnv -> History -> IO NeedsRebuilding
 checkHistory env (H hist) = do 
@@ -372,7 +371,7 @@ checkOne env goal_ = do
           report' env chatty $ "UNBLOCK " ++ show goal_
           return mtime
 
-      CheckHistory hist modtime unblock targets Nothing action -> do
+      CheckHistory _hist _modtime unblock targets Nothing action -> do
         -- One of the targets produced by the action is already known
         -- to require rebuilding.  We can shortcut this case here.
         let reason = "One of its rule targets needs rebuilding"
@@ -442,11 +441,11 @@ checkOne env goal_ = do
            markItemAsBuilding goal db (Rebuild "Not in database")
          Just (Dirty hist modtime) ->
            markItemAsBuilding goal db (CheckHistory hist modtime)
-         Just (Clean hist modtime) ->
+         Just (Clean _hist modtime) ->
            return (db, UptoDate modtime)
          Just (Building waitHandle) ->
            return (db, BlockOn waitHandle)
-         Just (Failed reason) ->
+         Just (Failed _reason) ->
            panic "NYE: Something failed"
 
    -- When we discover that an item *may* need rebuilding, we have to
@@ -467,10 +466,9 @@ checkOne env goal_ = do
        "REBUILD " ++ show goal_ ++ ": " ++ rebuildReason
      -- Execute the action
      (hist, modtimes) <- action env
-     let target_times = zip targets modtimes
      modifyMVar_ (aeDatabase env) $ \db ->
        return $ updateStatus db (targets `zip` map (Clean hist) modtimes)
-     unblock modtimes
+     _ <- unblock modtimes
      let Just idx = elemIndex goal_ targets
       -- return modification date of current goal
      return (modtimes !! idx)
@@ -615,57 +613,6 @@ loadDatabase fp =
 
 writeDatabase :: FilePath -> Database -> IO ()
 writeDatabase = encodeFile
-
---data BuildTodo
---  = NeedsRebuilding Reason
---  | CheckHistory History
-
-{-
--- | Atomically pick an unprocessed goal and mark it as in-progress.
--- 
--- While doing this, we will also discover clean goals, and
--- in-progress goals.  We return these as well.
-grabBuildTodo :: [CanonicalFilePath]
-              -> MVar Database
-              -> Act (Maybe (CanonicalFilePath, BuildTodo),
-                      [(CanonicalFilePath, ModTime)],
-                      [CanonicalFilePath],
-                      [CanonicalFilePath])
-                 -- ^ Returns:
-                 -- 
-                 --  * the picked goal (if any)
-                 -- 
-                 --  * the known clean files and their modification
-                 --    times
-                 -- 
-                 --  * the files that are in-progress
-                 -- 
-                 --  * the remaining (unprocessed) goals.
-                 --  
-grabBuildTodo goals dbmvar = modifyMVar dbmvar (\db -> go goals [] [] db)
- where
-   go [] cleans blocked db =
-     return (db, (Nothing, cleans, blocked []))
-   go (goal:goals) cleans blocked db = do
-     case M.lookup goal db of
-       Nothing ->
-         let db' = M.insert goal Building db in
-         return (db', (Just (goal, NeedsRebuilding "Not in database"),
-                       cleans, blocked, goals))
-       Just (Dirty hist) ->
-         let db' = M.insert goal Checking db in
-         return (db', (Just (goal, CheckHistory hist),
-                       cleans, blocked, goals))
-       Just (Clean mtime) -> go goals ((goal,mtime):cleans) blocked db
-       Just Checking      -> go goals cleans (goal:blocked) db
-       Just (Blocked _)   -> go goals cleans (goal:blocked) db
-       Just Building      -> go goals cleans (goal:blocked) db
-         -- TODO: A rule with multiple targets could mark an unprocessed
-         -- target as Building
-         -- panic "Building files: should not be in queue?"
-       Just Failed ->
-         cakefileError "TODO: something failed"
--}
 
 -- | Get file modification time (if the file exists).
 getFileModTime :: CanonicalFilePath -> IO (Maybe ModTime)
