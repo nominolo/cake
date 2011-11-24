@@ -1,0 +1,4 @@
+*~
+dist/
+.cakefile-db
+tests/test1/AB.txt
