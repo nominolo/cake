@@ -277,6 +277,10 @@ defaultRule env file = do
                            "MODTIME: " ++ show file ++ " = " ++ show modtime
                          return [modtime]))
 
+-- | Monadic map over a list keeping the @Just x@ results of the function.
+-- 
+-- In other words, @mapMaybeM = liftM catMaybes . mapM@ but it's slightly
+-- more efficient.
 mapMaybeM :: Monad m => (a -> m (Maybe b)) -> [a] -> m [b]
 mapMaybeM f = go
   where go []     = return []
@@ -286,6 +290,8 @@ mapMaybeM f = go
             Nothing ->             go xs
             Just y  -> liftM (y:) (go xs)
 
+-- | Run an @Act a@ action with an initially empty history and return
+-- final history.
 runAct :: ActEnv -> Act a -> IO (History, a)
 runAct env (Act act) = do
   mst <- newMVar (ActState{ asHistory = H [] })
@@ -294,35 +300,6 @@ runAct env (Act act) = do
   return (asHistory st, res)
 
 -- Check whether the given targets are up to date.
--- 
--- TODO: There are two ways to handle this:
--- 
---  1. Maintain a global work queue and workers just repeatedly
---     grab things from the work queue until everything is done.
--- 
---     This may have problems conceptially where a worker becomes
---     blocked on one task (e.g., it's waiting for a dependency to
---     build).  In this case we want the worker to start working on
---     something else.  There are two options:
--- 
---      a. The thread blocks, but no longer counts as a worker (by
---         releasing a lock).  Once the thread becomes unblocked
---         it tries to become a worker again.
--- 
---      b. We grab the current continuation and store it in the
---         database.  The worker is then free to to pick another
---         task.  Unless an error occurs, some worker will
---         eventually come back and pick up the continuation.
--- 
---     Option (a) is simpler, because in Option (b) we would have to
---     explicitly check that all dependencies are ready.  In Option
---     (a) we just block on all our dependencies and automatically get
---     woken up once the dependencies are ready.  In short, the
---     Haskell runtime system does the continuation management for us.
--- 
---  2. Build all dependencies in parallel.  Combined with Option (a)
---     above, this would mean we could hand off the work queue
---     managment to the Haskell thread scheduler as well.
 -- 
 
 type NeedsRebuilding = Bool
@@ -378,29 +355,31 @@ checkOne env goal_ = do
         runRule reason unblock targets action
 
       CheckHistory hist modtime unblock targets (Just modtimes) action -> do
-        -- TODO: Do we want to check all 'targets'?  This rule creates all
-        -- our targets.  Nevertheless, some targets may have different
-        -- modtimes.  However, we're only checking one file and we 
-        -- can assume that all targets share the same history (really?).
-        -- What about a rule that conditionally creates additional targets?
+        -- TODO: Do we want to check the history of all 'targets'?
+        -- This rule creates all our targets.  Nevertheless, some
+        -- targets may have different modtimes.  However, we're only
+        -- checking one file and we can assume that all targets share
+        -- the same history (really?).  Rules that conditionally
+        -- create targets are forbidden.
         --
-        -- Note: Checking history involves processing all recursively
+        -- Note: Checking history involves recursively
         -- checking/building all dependencies first.
         --
         -- Should we check history of all rule outputs?  No - they
-        -- must have the same history!
+        -- must have the same history!  (Unless we have overlapping
+        -- rules.)
         needs_rebuild <- checkHistory env hist
         if not needs_rebuild then do
           -- The history might be clean, but the file has been
           -- modified.  This could be the case if it's a file on disk
           -- (which doesn't have any dependencies) or it's an
-          -- auto-generated file and the user has accidentally edited.
-          -- In that case we must rebuild the file.
+          -- auto-generated file and the user has accidentally edited
+          -- it.  In that case we must rebuild the file.
           mb_time <- getFileModTime goal_
           case mb_time of
             Nothing -> do
-              -- History is clean, but file doesn't exist?  That's weird!
-              -- Just rebuild.
+              -- History is clean, but file doesn't exist?  May have
+              -- been deleted in a clean action.  Just rebuild.
               runRule "history clean, but file does not exist"
                       unblock targets action
             Just newtime | newtime /= modtime -> do
@@ -409,13 +388,12 @@ checkOne env goal_ = do
               runRule "history clean, but file has been modified"
                       unblock targets action
             _ -> do
-              -- NOW it's actually clean
+              -- NOW the target is actually clean.
               report' env chatty $
                 "HISTCLEAN " ++ show goal_ ++ " No rebuild needed"
               modifyMVar_ (aeDatabase env) (\db -> do
-                -- TODO: These should be the modtimes corresponding to the
-                -- targets (they may be slightly different)
-                let db' = updateStatus db $ zip targets (map (Clean hist) modtimes)
+                let db' = updateStatus db $
+                            zip targets (map (Clean hist) modtimes)
                 return db')
               unblock modtimes
               return modtime
@@ -431,8 +409,8 @@ checkOne env goal_ = do
    -- Atomically grab a BuildTodo.
    --
    -- If the Todo requires action, we immediately change the current
-   -- state of the item in the database, so that other workers will
-   -- wait for us.
+   -- state of the item in the database to Building, so that other
+   -- workers will wait for us.
    grabTodo :: CanonicalFilePath -> IO BuildTodo
    grabTodo goal = do
      modifyMVar (aeDatabase env) $ \db@(DB mdb) ->
@@ -453,7 +431,7 @@ checkOne env goal_ = do
 
    markItemAsBuilding goal db todo_kont = do
      -- TODO: Sanity check (goal `member` outputs)
-     -- TODO: Sanity check: none of the outputs are already building
+     -- TODO: Sanity check: none of the other outputs are already building
      (outputs, action) <- findRule env (aeRules env) goal
      (unblock, waitHandles) <- newWaitHandle outputs
      -- We need to lock all possibly generated targets at once.
@@ -483,8 +461,8 @@ updateStatus (DB db) ((goal, st):goals) =
 -- | Find modification times for targets if available for all targets.
 -- 
 -- Returns @Just modtimes@ iff a modification date was available for
--- each targets, i.e., for each file we either have a history or have
--- already built it.  @Nothing@, otherwise.
+-- each of the targets, i.e., for each file we either have a history
+-- or have already built it.  @Nothing@, otherwise.
 targetModTimes :: Database -> [Target] -> Maybe [ModTime]
 targetModTimes (DB db) targets = go targets []
  where
@@ -511,8 +489,21 @@ targetModTimes (DB db) targets = go targets []
 -- to check the history, because we have to lock all files while
 -- checking the history.
 
---data WaitHandle = 
-
+-- | A wait handle.
+-- 
+-- If we discover that a file is building, we store a @WaitHandle@ in
+-- the database.  If another worker thread comes along it will block
+-- on the wait handle.  When the building thread is done, it will
+-- unblock the wait handle and wake up any waiting threads.
+-- 
+-- A rule may build multiple targets.  This means that multiple
+-- threads may wait on the same action to finish, but actually want to
+-- read different files.  We therefore create multiple wait handles
+-- (one for each output) but they all share the same internal @MVar@.
+-- 
+-- When a wait handle is unblocked we return the modification time
+-- of the corresponding target.  We therefore store a selector function
+-- to pick the modification time.
 data WaitHandle = WaitHandle (MVar [ModTime]) ([ModTime] -> ModTime)
 
 instance Show WaitHandle where show _ = "<waithandle>"
@@ -521,18 +512,24 @@ instance Show WaitHandle where show _ = "<waithandle>"
 -- 
 -- This returns:
 -- 
---  * the function to unblock the handle
+--  * the function to unblock the handle.  It takes as argument the
+--    modification times of the targets.  Note that the order of the
+--    modification times must match the order of the targets.  I.e.,
+--    the first modification time, must be the modification time of
+--    the first target and so on.
 -- 
 --  * multiple handles that get unblocked simultaneously, but may
---    return different 'ModTime's.
+--    return different 'ModTime's.  The order matches the order of the
+--    targets.
 -- 
 newWaitHandle :: [CanonicalFilePath]
               -> IO ([ModTime] -> IO (), [WaitHandle])
 newWaitHandle goals = do
   mvar <- newEmptyMVar
-  return (\modtimes -> putMVar mvar modtimes
-         ,map (WaitHandle mvar) (take (length goals) selectorFunctions))
+  return (\modtimes -> putMVar mvar modtimes,
+          map (WaitHandle mvar) (take (length goals) selectorFunctions))
 
+-- | Block on a @WaitHandle@ until it's done.
 waitOnWaitHandle :: WaitHandle -> IO ModTime
 waitOnWaitHandle (WaitHandle mvar f) = do
   modtimes <- readMVar mvar
@@ -547,13 +544,17 @@ selectorFunctions = map nth [0..]
 
 -- | Describes what we should do with the target.
 data BuildTodo
-  = Rebuild Reason ([ModTime] -> IO ())
-            [CanonicalFilePath] (Maybe [ModTime])
-            (ActEnv -> IO (History, [ModTime]))
+  = Rebuild Reason -- why are we rebuilding?
+            ([ModTime] -> IO ()) -- unblock function of wait handle.
+            [CanonicalFilePath] -- the targets we're goint to build
+            (Maybe [ModTime]) -- their modification times if all known
+            (ActEnv -> IO (History, [ModTime])) -- build action
     -- ^ The target must be rebuilt.  The 'Reason' is a human-readable
     -- description of why it needs to be rebuilt.
-  | CheckHistory History ModTime ([ModTime] -> IO ())
-                 [CanonicalFilePath] (Maybe [ModTime])
+  | CheckHistory History ModTime
+                 ([ModTime] -> IO ())  -- same as above
+                 [CanonicalFilePath]
+                 (Maybe [ModTime])
                  (ActEnv -> IO (History, [ModTime]))
     -- ^ The target may not be up to date, so we have to check its
     -- history.
