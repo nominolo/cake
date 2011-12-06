@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable, BangPatterns #-}
+{-# LANGUAGE DeriveDataTypeable, BangPatterns, ScopedTypeVariables #-}
 {-# OPTIONS_GHC -Wall -fno-warn-orphans #-}
 module Development.Cake.Core where
 
@@ -10,8 +10,11 @@ import Control.Monad
 import Control.Monad.IO.Class
 import Control.Concurrent.ParallelIO.Local
 import Data.Binary
+import Data.Either
 import Data.List
+import Data.Maybe ( catMaybes )
 import Data.Typeable ( Typeable(..) )
+import GHC.Conc ( numCapabilities )
 import System.Directory ( getModificationTime )
 import System.FilePath.Canonical
 import System.IO.Error ( isDoesNotExistError )
@@ -45,21 +48,21 @@ data Status
   = Dirty History ModTime
   | Building WaitHandle
   | Clean History ModTime
-  | Failed Reason
+  | Failed CakefileException
   deriving Show
 
 instance Binary Status where
   put (Dirty hist t) = putWord8 1 >> put hist >> put t
   put (Clean hist t) = putWord8 2 >> put hist >> put t
   put (Building _) = error "Cannot serialise in-progress database"
-  put (Failed msg) = putWord8 3 >> put msg
+  put (Failed msg) = putWord8 3 >> put (showCakefileException msg)
 
   get = do
     tag <- getWord8
     case tag of
       1 -> Dirty <$> get <*> get
       2 -> Dirty <$> get <*> get  -- load all files as dirty!
-      3 -> Failed <$> get
+      3 -> Failed . RuleError <$> get
       _ -> error "Invalid tag when deserialising Status"
 
 -- State transitions:
@@ -140,6 +143,7 @@ instance Monad Act where
   act >>= k = Act (\env mst -> do
                 a <- unAct act env mst
                 unAct (k a) env mst)
+  fail msg = Act (\_env _mst -> throwIO (RuleError msg))
 
 instance MonadIO Act where
   liftIO ioact = Act (\_env _mst -> ioact)
@@ -202,8 +206,11 @@ type Pattern = String
 
 data CakefileException
   = RuleError String
-  | RecursiveError [([String], CakefileException)]
+  | RecursiveError [(TargetDescr, CakefileException)]
+  | WrappedException SomeException
   deriving Typeable
+
+type TargetDescr = String
 
 instance Show CakefileException where
   show = unlines . showCakefileException
@@ -211,14 +218,25 @@ instance Show CakefileException where
 showCakefileException :: CakefileException -> [String]
 showCakefileException (RuleError s) =
   ["Error in rule definition: " ++ s]
-showCakefileException (RecursiveError _) =
-  ["Error in recursive invokation"]
+showCakefileException (WrappedException e) =
+  ["Error while executing rule: " ++ show e]
+showCakefileException (RecursiveError nested_errs) =
+  ["The following dependenc" ++ plural_y ++ " failed to build: "] ++
+  map indent (concatMap showNested nested_errs)
+ where
+   indent line = "  " ++ line
+   showNested (target, exception) =
+     [ target ++ ":" ] ++ map indent (showCakefileException exception)
+   plural_y = case nested_errs of
+                [_] -> "y"
+                _ -> "ies"
 
 instance Exception.Exception CakefileException
 
 instance NFData CakefileException where
     rnf (RuleError a) = rnf a
-    rnf (RecursiveError ls) = rnf ls
+    rnf (RecursiveError nesteds) = rnf nesteds
+    rnf (WrappedException _) = ()
 
 type CakeSuccess a = Either CakefileException a
 
@@ -265,6 +283,11 @@ findRule env ruleSet goal = do
  where
    tryToMatch gl rule = rule gl
 
+-- | Returns the default rule for the given target (if any).
+-- 
+-- For a file we have a default rule if the file already exists on
+-- disk.  The returned action merely returns the modification date of
+-- the file.
 defaultRule :: ActEnv -> CanonicalFilePath
             -> IO (Maybe ([CanonicalFilePath], IO [ModTime]))
 defaultRule env file = do
@@ -302,51 +325,69 @@ runAct env (Act act) = do
 -- Check whether the given targets are up to date.
 -- 
 
-type NeedsRebuilding = Bool
+type NeedsRebuilding = Either CakefileException [ModTime]
+
+-- | The result of checking a history entry.
+data CheckQAResult
+  = QAFailure CakefileException
+    -- ^ The target (or any of its dependencies) failed to build.
+  | QAClean
+    -- ^ The target (and all its dependencies) is up to date.
+  | QARebuild
+    -- ^ The target needs to be rebuilt.
 
 -- | Check a single history entry.
 -- 
--- Returns ... (TODO)
-checkQA :: ActEnv -> QA -> IO NeedsRebuilding
+-- Checking a single dependency means also checking its dependencies
+-- and their dependencies, etc.  If any of the dependencies need
+-- rebuilding, we do so right away.  In these cases, the checked
+-- target needs rebuilding as well, so we return 'QARebuild' (or
+-- 'QAFailure').
+checkQA :: ActEnv -> QA -> IO CheckQAResult
 checkQA env (Need entries) = do
   let (outputs, old_modtimes) = unzip entries
-  -- TODO: Exception handling?
-  new_modtimes <- parallel (aePool env) $
-                    map (checkOne env{ aeNestLevel = aeNestLevel env + 1 }) outputs
-  let oks = zipWith3 check outputs new_modtimes old_modtimes
-  report' env chatty $
-    "CHECKQA " ++ show (zip new_modtimes old_modtimes) ++ "\n" ++
-    show oks
-  return (not (and oks))
+  result <- need' env outputs
+  case result of
+    Right new_modtimes -> do
+      let oks = zipWith3 check outputs new_modtimes old_modtimes
+      report' env chatty $
+        "CHECKQA " ++ show (zip new_modtimes old_modtimes) ++ "\n" ++
+        show oks
+      return (if and oks then QAClean else QARebuild)
+    Left err -> return (QAFailure err)
  where
    check _goal new_time old_time = old_time == new_time
+   
 
-checkHistory :: ActEnv -> History -> IO NeedsRebuilding
+checkHistory :: ActEnv -> History -> IO CheckQAResult
 checkHistory env (H hist) = do 
   report' env chatty $ "HISTCHECK (" ++ show (length hist) ++ ")"
   go hist
  where
-   go []       = return False
+   go []       = return QAClean
    go (qa:qas) = do rebuild <- checkQA env qa
-                    if rebuild then return True else go qas
+                    case rebuild of
+                      QAClean -> go qas
+                      _ -> return rebuild
 
-checkOne :: ActEnv -> CanonicalFilePath -> IO ModTime
+checkOne :: ActEnv -> CanonicalFilePath
+         -> IO (Either CakefileException ModTime)
 checkOne env goal_ = do
   todo <- grabTodo goal_
-  modtime <- 
+  result <- 
     case todo of
       UptoDate modtime -> do
         report' env chatty $ "CLEAN " ++ show goal_
-        return modtime
+        return (Right modtime)
 
       BlockOn waitHandle -> do
         -- We are about to block on the wait handle, make sure we
         -- release the worker as required by "parallel-io"
         report' env chatty $ "BLOCK " ++ show goal_
         extraWorkerWhileBlocked (aePool env) $ do
-          mtime <- waitOnWaitHandle waitHandle
+          result <- waitOnWaitHandle waitHandle
           report' env chatty $ "UNBLOCK " ++ show goal_
-          return mtime
+          return result
 
       CheckHistory _hist _modtime unblock targets Nothing action -> do
         -- One of the targets produced by the action is already known
@@ -369,42 +410,54 @@ checkOne env goal_ = do
         -- must have the same history!  (Unless we have overlapping
         -- rules.)
         needs_rebuild <- checkHistory env hist
-        if not needs_rebuild then do
-          -- The history might be clean, but the file has been
-          -- modified.  This could be the case if it's a file on disk
-          -- (which doesn't have any dependencies) or it's an
-          -- auto-generated file and the user has accidentally edited
-          -- it.  In that case we must rebuild the file.
-          mb_time <- getFileModTime goal_
-          case mb_time of
-            Nothing -> do
-              -- History is clean, but file doesn't exist?  May have
-              -- been deleted in a clean action.  Just rebuild.
-              runRule "history clean, but file does not exist"
-                      unblock targets action
-            Just newtime | newtime /= modtime -> do
-              report' env chatty $ "MODIFIED " ++ show goal_ ++
-                                   show (modtime, newtime)
-              runRule "history clean, but file has been modified"
-                      unblock targets action
-            _ -> do
-              -- NOW the target is actually clean.
-              report' env chatty $
-                "HISTCLEAN " ++ show goal_ ++ " No rebuild needed"
-              modifyMVar_ (aeDatabase env) (\db -> do
-                let db' = updateStatus db $
-                            zip targets (map (Clean hist) modtimes)
-                return db')
-              unblock modtimes
-              return modtime
-         else do
-           runRule "history check failed, one or more dependencies changed"
-                   unblock targets action
+        case needs_rebuild of
+          QARebuild ->
+            runRule "history check failed, one or more dependencies changed"
+                    unblock targets action
+--          QAFailure errs -> do
+--            let err = RecursiveError (map show outputs) (head errs)
+          QAFailure err -> do
+            modifyMVar_ (aeDatabase env) $ \db ->
+              return $ updateStatus db (targets `zip` (repeat (Failed err)))
+            _ <- unblock (Left err)
+            return (Left err)
+          QAClean -> do
+            -- The history might be clean, but the file has been
+            -- modified.  This could be the case if it's a file on disk
+            -- (which doesn't have any dependencies) or it's an
+            -- auto-generated file and the user has accidentally edited
+            -- it.  In that case we must rebuild the file.
+            mb_time <- getFileModTime goal_
+            case mb_time of
+              Nothing -> do
+                -- History is clean, but file doesn't exist?  May have
+                -- been deleted in a clean action.  Just rebuild.
+                runRule "history clean, but file does not exist"
+                        unblock targets action
+              Just newtime | newtime /= modtime -> do
+                report' env chatty $ "MODIFIED " ++ show goal_ ++
+                                     show (modtime, newtime)
+                runRule "history clean, but file has been modified"
+                        unblock targets action
+              _ -> do
+                -- NOW the target is actually clean.
+                report' env chatty $
+                  "HISTCLEAN " ++ show goal_ ++ " No rebuild needed"
+                modifyMVar_ (aeDatabase env) (\db -> do
+                  let db' = updateStatus db $
+                              zip targets (map (Clean hist) modtimes)
+                  return db')
+                unblock (Right modtimes)
+                return (Right modtime)
 
       Rebuild reason unblock targets _modtimes action -> do
         runRule reason unblock targets action
-  report' env chatty $ "DONE " ++ show goal_ ++ " " ++ show modtime
-  return modtime
+
+      PropagateFailure exc -> do
+        return (Left exc)
+
+  report' env chatty $ "DONE " ++ show goal_ ++ " " ++ show result
+  return result
  where
    -- Atomically grab a BuildTodo.
    --
@@ -423,33 +476,75 @@ checkOne env goal_ = do
            return (db, UptoDate modtime)
          Just (Building waitHandle) ->
            return (db, BlockOn waitHandle)
-         Just (Failed _reason) ->
-           panic "NYE: Something failed"
+         Just (Failed exception) ->
+           return (db, PropagateFailure exception)
+--           markItemAsFailed goal db exception
+           -- TODO: mark all rule targets as failed, too.
+           --return (db, PropagateFailure exception)
+--           panic "NYE: Something failed"
 
    -- When we discover that an item *may* need rebuilding, we have to
    -- lock it in the database before we release the lock.
-
+   
+   markItemAsBuilding :: CanonicalFilePath -> Database
+                      -> ((Either CakefileException [ModTime] -> IO ())
+                          -> [CanonicalFilePath] 
+                          -> Maybe [ModTime]
+                          -> (ActEnv -> IO (History, [ModTime]))
+                          -> BuildTodo)
+                      -> IO (Database, BuildTodo)
    markItemAsBuilding goal db todo_kont = do
      -- TODO: Sanity check (goal `member` outputs)
      -- TODO: Sanity check: none of the other outputs are already building
-     (outputs, action) <- findRule env (aeRules env) goal
-     (unblock, waitHandles) <- newWaitHandle outputs
-     -- We need to lock all possibly generated targets at once.
-     let db' = updateStatus db (zip outputs (map Building waitHandles))
-     let mtimes = targetModTimes db outputs
-     return (db', todo_kont unblock outputs mtimes action)
+     -- TODO: findRule may throw an exception!
+     mb_rule <- try $ findRule env (aeRules env) goal
+     case mb_rule of
+       Right (outputs, action) -> do
+         (unblock, waitHandles) <- newWaitHandle outputs
+         -- We need to lock all possibly generated targets at once.
+         let db' = updateStatus db (zip outputs (map Building waitHandles))
+         let mtimes = targetModTimes db outputs
+         return (db', todo_kont unblock outputs mtimes action)
+       Left exc -> do
+         let db' = updateStatus db (zip [goal] [Failed exc])
+         return (db', PropagateFailure exc)
+--         return (db', 
 
    runRule rebuildReason unblock targets action = do
      report' env chatty $
        "REBUILD " ++ show goal_ ++ ": " ++ rebuildReason
      -- Execute the action
-     (hist, modtimes) <- action env
-     modifyMVar_ (aeDatabase env) $ \db ->
-       return $ updateStatus db (targets `zip` map (Clean hist) modtimes)
-     _ <- unblock modtimes
-     let Just idx = elemIndex goal_ targets
-      -- return modification date of current goal
-     return (modtimes !! idx)
+     actResult <- try (action env)
+     case actResult of
+       Right (hist, modtimes) -> do
+         modifyMVar_ (aeDatabase env) $ \db ->
+           return $ updateStatus db (targets `zip` map (Clean hist) modtimes)
+         _ <- unblock (Right modtimes)
+         let Just idx = elemIndex goal_ targets
+          -- return modification date of current goal
+         return (Right (modtimes !! idx))
+       Left (someExc :: SomeException) -> do
+         -- Yes, we're catching *all* exceptions.  This should be
+         -- fine, because we're going to abort building anyway.  We
+         -- only unroll the dependency chain to build a more
+         -- informative error.
+         --
+         -- The final top-level 'need' will then rethrow the resulting
+         -- exception.  A problem is that the top-level exception will
+         -- always be a 'CakefileException', if the user pressed
+         -- Control-C that information will be hidden inside the
+         -- CakefileException.
+         let exc = wrapException someExc
+         modifyMVar_ (aeDatabase env) $ \db ->
+           return $ updateStatus db (targets `zip` (repeat (Failed exc)))
+         _ <- unblock (Left exc)
+         return (Left exc)
+
+wrapException :: SomeException -> CakefileException
+wrapException exc =
+  case fromException exc of
+    Just e -> e
+    Nothing -> WrappedException exc
 
 -- | Updates each 'Target''s status in the database.
 updateStatus :: Database -> [(Target, Status)] -> Database
@@ -504,7 +599,10 @@ targetModTimes (DB db) targets = go targets []
 -- When a wait handle is unblocked we return the modification time
 -- of the corresponding target.  We therefore store a selector function
 -- to pick the modification time.
-data WaitHandle = WaitHandle (MVar [ModTime]) ([ModTime] -> ModTime)
+data WaitHandle =
+  WaitHandle (MVar [BuildResult]) ([BuildResult] -> BuildResult)
+
+type BuildResult = Either CakefileException ModTime
 
 instance Show WaitHandle where show _ = "<waithandle>"
 
@@ -512,7 +610,7 @@ instance Show WaitHandle where show _ = "<waithandle>"
 -- 
 -- This returns:
 -- 
---  * the function to unblock the handle.  It takes as argument the
+--  * A function to unblock the handle.  It takes as argument the
 --    modification times of the targets.  Note that the order of the
 --    modification times must match the order of the targets.  I.e.,
 --    the first modification time, must be the modification time of
@@ -523,14 +621,19 @@ instance Show WaitHandle where show _ = "<waithandle>"
 --    targets.
 -- 
 newWaitHandle :: [CanonicalFilePath]
-              -> IO ([ModTime] -> IO (), [WaitHandle])
+              -> IO (Either CakefileException [ModTime] -> IO (),
+                     [WaitHandle])
 newWaitHandle goals = do
   mvar <- newEmptyMVar
-  return (\modtimes -> putMVar mvar modtimes,
+  let ngoals = length goals
+  return (\modtimes ->
+            case modtimes of
+              Left exc -> putMVar mvar (replicate ngoals (Left exc))
+              Right mtimes -> putMVar mvar (map Right mtimes),
           map (WaitHandle mvar) (take (length goals) selectorFunctions))
 
 -- | Block on a @WaitHandle@ until it's done.
-waitOnWaitHandle :: WaitHandle -> IO ModTime
+waitOnWaitHandle :: WaitHandle -> IO BuildResult
 waitOnWaitHandle (WaitHandle mvar f) = do
   modtimes <- readMVar mvar
   return (f modtimes)
@@ -545,14 +648,14 @@ selectorFunctions = map nth [0..]
 -- | Describes what we should do with the target.
 data BuildTodo
   = Rebuild Reason -- why are we rebuilding?
-            ([ModTime] -> IO ()) -- unblock function of wait handle.
+            UnblockAction -- unblock function of wait handle.
             [CanonicalFilePath] -- the targets we're goint to build
             (Maybe [ModTime]) -- their modification times if all known
             (ActEnv -> IO (History, [ModTime])) -- build action
     -- ^ The target must be rebuilt.  The 'Reason' is a human-readable
     -- description of why it needs to be rebuilt.
   | CheckHistory History ModTime
-                 ([ModTime] -> IO ())  -- same as above
+                 UnblockAction  -- same as above
                  [CanonicalFilePath]
                  (Maybe [ModTime])
                  (ActEnv -> IO (History, [ModTime]))
@@ -564,17 +667,52 @@ data BuildTodo
     -- ^ The target is currently being processed by another worker,
     -- (or that worker is blocked on another dependency and so on) so
     -- we have to wait for it.
+  | PropagateFailure CakefileException
+    -- ^ We previously tried to build the target and got an error.  We
+    -- now propagate this error to its dependents.
+
+type UnblockAction = Either CakefileException [ModTime] -> IO ()
 
 ------------------------------------------------------------------------
 -- * User API
 
+-- | Ensure all given targets are up to date.
+need' :: MonadIO m =>
+         ActEnv -> [CanonicalFilePath]
+      -> m (Either CakefileException [ModTime])
+need' env goals = do
+  results <- liftIO $ parallel (aePool env) $
+               map (checkOne env{ aeNestLevel = aeNestLevel env + 1 }) goals
+  case partitionEithers results of
+    ([], modtimes) -> return (Right modtimes)
+    (_:_, _) ->
+      return (Left (mkRecursiveError (zip goals results)))
+
+mkRecursiveError :: [(CanonicalFilePath, Either CakefileException ModTime)]
+                 -> CakefileException
+mkRecursiveError = RecursiveError . mapFilter keepError
+ where
+   keepError (fp, Left err) = Just (show fp, err)
+   keepError _              = Nothing
+
+-- | Combines 'map' and 'filter' into one operation.  If the function
+-- argument returns @Just y@, then @y@ will appear in the result list.
+-- Preserves ordering of the input list.
+mapFilter :: (a -> Maybe b) -> [a] -> [b]
+mapFilter f = catMaybes . map f
+
 need :: [CanonicalFilePath] -> Act [ModTime]
 need goals = do
   env <- askActEnv
-  modtimes <- liftIO $ parallel (aePool env) $ map (checkOne env{ aeNestLevel = aeNestLevel env + 1 }) goals
-  appendHistory (Need (goals `zip` modtimes))
-  return modtimes
+  result <- need' env goals
+  case result of
+    Right modtimes -> do
+      appendHistory (Need (goals `zip` modtimes))
+      return modtimes
+    Left err ->
+      liftIO $ throwIO err
 
+-- | Run a 'Cake' monad.
 cake :: Cake () -> IO ()
 cake act = do
   mst <- newMVar (CakeState{ csRules = [], csActs = [] })
@@ -586,13 +724,14 @@ cake act = do
   printDatabase db
   mdb <- newMVar db
   logLock <- newMVar ()
-  withPool 2 $ \pool -> do
+  let poolSize = numCapabilities + 1
+  withPool poolSize $ \pool -> do
     let env = ActEnv{ aeDatabase = mdb,
                       aeRules = reverse rules,
                       aePool = pool,
                       aeLogLock = logLock,
                       aeNestLevel = 0 }
-    -- This is where we kick of the actual work
+    -- This is where we kick off the actual work
     parallel_ pool $ map (runAct env) acts
     report' env chatty $ "Writing database"
     db' <- takeMVar mdb
