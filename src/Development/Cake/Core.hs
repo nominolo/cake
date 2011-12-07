@@ -44,18 +44,19 @@ type Target = CanonicalFilePath
 --   QA String
 --  deriving (Eq, Ord, Show)
 
+
 data Status
   = Dirty History ModTime
   | Building WaitHandle
   | Clean History ModTime
-  | Failed CakefileException
+  | Failed CakeException
   deriving Show
 
 instance Binary Status where
   put (Dirty hist t) = putWord8 1 >> put hist >> put t
   put (Clean hist t) = putWord8 2 >> put hist >> put t
   put (Building _) = error "Cannot serialise in-progress database"
-  put (Failed msg) = putWord8 3 >> put (showCakefileException msg)
+  put (Failed msg) = putWord8 3 >> put (showCakeException msg)
 
   get = do
     tag <- getWord8
@@ -204,44 +205,44 @@ mkDatabase = newMVar (DB M.empty)
 
 type Pattern = String
 
-data CakefileException
+data CakeException
   = RuleError String
-  | RecursiveError [(TargetDescr, CakefileException)]
+  | RecursiveError [(TargetDescr, CakeException)]
   | WrappedException SomeException
   deriving Typeable
 
 type TargetDescr = String
 
-instance Show CakefileException where
-  show = unlines . showCakefileException
+instance Show CakeException where
+  show = unlines . showCakeException
 
-showCakefileException :: CakefileException -> [String]
-showCakefileException (RuleError s) =
+showCakeException :: CakeException -> [String]
+showCakeException (RuleError s) =
   ["Error in rule definition: " ++ s]
-showCakefileException (WrappedException e) =
+showCakeException (WrappedException e) =
   ["Error while executing rule: " ++ show e]
-showCakefileException (RecursiveError nested_errs) =
+showCakeException (RecursiveError nested_errs) =
   ["The following dependenc" ++ plural_y ++ " failed to build: "] ++
   map indent (concatMap showNested nested_errs)
  where
    indent line = "  " ++ line
    showNested (target, exception) =
-     [ target ++ ":" ] ++ map indent (showCakefileException exception)
+     [ target ++ ":" ] ++ map indent (showCakeException exception)
    plural_y = case nested_errs of
                 [_] -> "y"
                 _ -> "ies"
 
-instance Exception.Exception CakefileException
+instance Exception.Exception CakeException
 
-instance NFData CakefileException where
+instance NFData CakeException where
     rnf (RuleError a) = rnf a
     rnf (RecursiveError nesteds) = rnf nesteds
     rnf (WrappedException _) = ()
 
-type CakeSuccess a = Either CakefileException a
+type CakeSuccess a = Either CakeException a
 
-cakefileError :: String -> IO a
-cakefileError s = Exception.throwIO $ RuleError s
+cakeError :: String -> IO a
+cakeError s = Exception.throwIO $ RuleError s
 
 panic :: String -> IO a
 panic s = Exception.throwIO $ RuleError ("PANIC: " ++ s)
@@ -267,7 +268,7 @@ findRule env ruleSet goal = do
         "NORULE " ++ show goal ++ ": using default rule"
       mb_dflt <- defaultRule env goal
       case mb_dflt of
-        Nothing -> cakefileError $ "No rule to build " ++ show goal
+        Nothing -> cakeError $ "No rule to build " ++ show goal
         Just (outs, act) ->
           return (outs, \_env -> do modtimes <- liftIO act
                                     return (H [], modtimes))
@@ -325,11 +326,11 @@ runAct env (Act act) = do
 -- Check whether the given targets are up to date.
 -- 
 
-type NeedsRebuilding = Either CakefileException [ModTime]
+type NeedsRebuilding = Either CakeException [ModTime]
 
 -- | The result of checking a history entry.
 data CheckQAResult
-  = QAFailure CakefileException
+  = QAFailure CakeException
     -- ^ The target (or any of its dependencies) failed to build.
   | QAClean
     -- ^ The target (and all its dependencies) is up to date.
@@ -371,7 +372,7 @@ checkHistory env (H hist) = do
                       _ -> return rebuild
 
 checkOne :: ActEnv -> CanonicalFilePath
-         -> IO (Either CakefileException ModTime)
+         -> IO (Either CakeException ModTime)
 checkOne env goal_ = do
   todo <- grabTodo goal_
   result <- 
@@ -487,7 +488,7 @@ checkOne env goal_ = do
    -- lock it in the database before we release the lock.
    
    markItemAsBuilding :: CanonicalFilePath -> Database
-                      -> ((Either CakefileException [ModTime] -> IO ())
+                      -> ((Either CakeException [ModTime] -> IO ())
                           -> [CanonicalFilePath] 
                           -> Maybe [ModTime]
                           -> (ActEnv -> IO (History, [ModTime]))
@@ -531,16 +532,16 @@ checkOne env goal_ = do
          --
          -- The final top-level 'need' will then rethrow the resulting
          -- exception.  A problem is that the top-level exception will
-         -- always be a 'CakefileException', if the user pressed
+         -- always be a 'CakeException', if the user pressed
          -- Control-C that information will be hidden inside the
-         -- CakefileException.
+         -- CakeException.
          let exc = wrapException someExc
          modifyMVar_ (aeDatabase env) $ \db ->
            return $ updateStatus db (targets `zip` (repeat (Failed exc)))
          _ <- unblock (Left exc)
          return (Left exc)
 
-wrapException :: SomeException -> CakefileException
+wrapException :: SomeException -> CakeException
 wrapException exc =
   case fromException exc of
     Just e -> e
@@ -602,7 +603,7 @@ targetModTimes (DB db) targets = go targets []
 data WaitHandle =
   WaitHandle (MVar [BuildResult]) ([BuildResult] -> BuildResult)
 
-type BuildResult = Either CakefileException ModTime
+type BuildResult = Either CakeException ModTime
 
 instance Show WaitHandle where show _ = "<waithandle>"
 
@@ -621,7 +622,7 @@ instance Show WaitHandle where show _ = "<waithandle>"
 --    targets.
 -- 
 newWaitHandle :: [CanonicalFilePath]
-              -> IO (Either CakefileException [ModTime] -> IO (),
+              -> IO (Either CakeException [ModTime] -> IO (),
                      [WaitHandle])
 newWaitHandle goals = do
   mvar <- newEmptyMVar
@@ -667,11 +668,11 @@ data BuildTodo
     -- ^ The target is currently being processed by another worker,
     -- (or that worker is blocked on another dependency and so on) so
     -- we have to wait for it.
-  | PropagateFailure CakefileException
+  | PropagateFailure CakeException
     -- ^ We previously tried to build the target and got an error.  We
     -- now propagate this error to its dependents.
 
-type UnblockAction = Either CakefileException [ModTime] -> IO ()
+type UnblockAction = Either CakeException [ModTime] -> IO ()
 
 ------------------------------------------------------------------------
 -- * User API
@@ -679,7 +680,7 @@ type UnblockAction = Either CakefileException [ModTime] -> IO ()
 -- | Ensure all given targets are up to date.
 need' :: MonadIO m =>
          ActEnv -> [CanonicalFilePath]
-      -> m (Either CakefileException [ModTime])
+      -> m (Either CakeException [ModTime])
 need' env goals = do
   results <- liftIO $ parallel (aePool env) $
                map (checkOne env{ aeNestLevel = aeNestLevel env + 1 }) goals
@@ -688,8 +689,8 @@ need' env goals = do
     (_:_, _) ->
       return (Left (mkRecursiveError (zip goals results)))
 
-mkRecursiveError :: [(CanonicalFilePath, Either CakefileException ModTime)]
-                 -> CakefileException
+mkRecursiveError :: [(CanonicalFilePath, Either CakeException ModTime)]
+                 -> CakeException
 mkRecursiveError = RecursiveError . mapFilter keepError
  where
    keepError (fp, Left err) = Just (show fp, err)
@@ -745,11 +746,20 @@ addRule rule = Cake (\mst -> do
     return st{ csRules = rule : csRules st }))
 
 databaseFilePath :: FilePath
-databaseFilePath = ".cakefile-db"
+databaseFilePath = ".cake-db"
 
 loadDatabase :: FilePath -> IO Database
 loadDatabase fp =
-  handleDoesNotExist (return (DB M.empty)) $ decodeFile fp
+  stripFailures <$> handleDoesNotExist (return (DB M.empty)) (decodeFile fp)
+ where
+   -- TODO: We need to think about what should happen to on-disk DB
+   -- entries for Failed builds.  Currently, we strip them from the
+   -- loaded DB, so that we try to build them again this time around.
+   -- Is there anything better we can do?
+   stripFailures (DB mp) = DB (M.filter (not . isFailure) mp)
+
+   isFailure (Failed _) = True
+   isFailure _ = False
 
 writeDatabase :: FilePath -> Database -> IO ()
 writeDatabase = encodeFile
@@ -761,11 +771,19 @@ getFileModTime cfp =
     Just . M <$> getModificationTime (canonicalFilePath cfp)
 
 -- | Do an action in case we get a file-does-not-exist exception.
+-- 
+-- Argument order is the same as for 'handle'.
 handleDoesNotExist :: IO a  -- ^ Do this in case of error
-                   -> IO a  -- ^ Do this otherwise
+                   -> IO a  -- ^ Try doing this.
                    -> IO a
 handleDoesNotExist = handleIf isDoesNotExistError
 
-handleIf :: Exception.Exception e => (e -> Bool) -> IO a -> IO a -> IO a
+-- | Variant of 'handleJust' with a predicate instead of a 'Just b'
+-- transformer.
+handleIf :: Exception.Exception e =>
+            (e -> Bool) -- ^ Handle exception if this function returns 'True'.
+         -> IO a -- ^ Handler (executed if body raises an exception).
+         -> IO a -- ^ Body.
+         -> IO a
 handleIf p handler act =
   Exception.handleJust (guard . p) (\() -> handler) act
