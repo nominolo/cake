@@ -1,12 +1,15 @@
 module Development.Cake
   ( need, Core.cake, want, Cake, Act,
 
-    cat, (*>)  
+    cat, (*>),
+
+    env
   )
 where
 
 import Development.Cake.Core ( Generates(..), Act, Cake, ModTime )
 import qualified Development.Cake.Core as Core
+import Development.Cake.Oracles.Env
 
 import Control.Concurrent ( threadDelay )
 import Control.Monad ( guard )
@@ -14,7 +17,7 @@ import Control.Monad.IO.Class
 import System.Exit
 import System.FilePath
 import System.FilePath.Canonical
-import System.Process
+import System.Process hiding ( env )
 import qualified Data.ByteString.Lazy as L
 import qualified System.FilePath.Glob as Glob
 

@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveDataTypeable, BangPatterns, ScopedTypeVariables #-}
+{-# LANGUAGE ExistentialQuantification #-}
 {-# OPTIONS_GHC -Wall -fno-warn-orphans #-}
 module Development.Cake.Core where
 
@@ -41,9 +42,65 @@ instance Binary Database where
   get = DB <$> get
 
 type Target = CanonicalFilePath
---   QA String
---  deriving (Eq, Ord, Show)
 
+-- | A question with a namespace and a question as an arbitrary string.
+--
+-- The user usually shouldn't use this type.  Instead, the oracle provider
+-- should implement wrappers that construct the question of the right form
+-- and pass it to 'query'.
+--
+-- See also: 'installOracle'.
+--
+data Question = Question String String -- namespace + question
+  deriving (Eq, Ord)
+
+instance Show Question where
+  show (Question namespace question) =
+    "Q[" ++ namespace ++ "]: " ++ show question
+
+instance Binary Question where
+  put (Question n q) = put n >> put q
+  get = Question <$> get <*> get
+
+-- TODO: ATM, Oracles are expected to do their own answer-caching.
+
+-- | Install a new oracle for answering non-file requirements.
+--
+-- Oracles are used for things such as listing directory contents or
+-- querying environment variables.  It's called an oracle because all
+-- it does is answer questions, but we don't care how it does that.
+--
+-- An oracle should typically be total.  The @Nothing@ result is intended
+-- to communicate the fact that the given oracle didn't understand the
+-- question.  Each question has a namespace, and an oracle should only
+-- answer questions for its namespace.  Use exceptions if partiality is
+-- really required, e.g., @ls@ may fail due to access control errors.
+--
+installOracle :: (Question -> IO (Maybe Answer)) -> Cake ()
+installOracle fn = Cake $ \mst -> do
+  modifyMVar_ mst $ \st ->
+    return st{ csOracle = fn `combineOracle` csOracle st }
+ where
+   combineOracle oracle1 oracle2 question = do
+     mb_ans <- oracle1 question
+     case mb_ans of
+       Nothing -> oracle2 question
+       Just _  -> return mb_ans
+
+query :: Question -> Act Answer
+query question = do
+  oracle <- aeOracle <$> askActEnv
+  mb_answer <- liftIO (try (oracle question))
+  case mb_answer of
+    Right (Just answer) -> do
+      appendHistory (Oracle question answer)
+      return answer
+    Right Nothing ->
+      fail $ "Could not answer question: " ++ show question ++
+             "\nMissing oracle?"
+    Left err -> liftIO (throwIO (WrappedException err))
+
+type Answer = [String]
 
 data Status
   = Dirty History ModTime
@@ -75,6 +132,7 @@ type Reason = String
 data ActEnv = ActEnv
   { aeDatabase :: MVar Database
   , aeRules :: [Rule]
+  , aeOracle :: Question -> IO (Maybe Answer)
   , aePool :: Pool
   , aeLogLock :: MVar ()
   , aeNestLevel :: Int
@@ -106,8 +164,7 @@ report' env _verb msg =
 -- | Rules within a rule set are in the same order in which they were
 -- added.
 type RuleSet = [Rule]
-data Question = Q String String
-newtype Answer = A [String]
+
 newtype History = H [QA]
   deriving Show
 
@@ -118,16 +175,18 @@ instance Binary History where
 -- | An entry in the history.
 -- 
 -- For files, it generates 
-data QA = -- Oracle Question Answer
-        Need [(CanonicalFilePath, ModTime)]
+data QA = Oracle Question Answer
+        | Need [(CanonicalFilePath, ModTime)]
  deriving Show
 
 instance Binary QA where
   put (Need entries) = putWord8 1 >> put entries
+  put (Oracle question ans) = putWord8 2 >> put question >> put ans
   get = do
     tag <- getWord8
     case tag of
       1 -> Need <$> get
+      2 -> Oracle <$> get <*> get
       _ -> error "Cannot decode QA"
 
 instance Binary CanonicalFilePath where
@@ -138,6 +197,12 @@ newtype Act a = Act { unAct :: ActEnv -> MVar ActState -> IO a }
 
 askActEnv :: Act ActEnv
 askActEnv = Act (\env _ -> return env)
+
+tryAct :: Exception e => Act a -> Act (Either e a)
+tryAct body = Act (\env mst -> try (unAct body env mst))
+
+instance Functor Act where 
+  fmap f act = Act (\env mst -> fmap f (unAct act env mst))
 
 instance Monad Act where
   return x = Act (\_env _mst -> return x)
@@ -162,7 +227,8 @@ newtype Cake a = Cake { unCake :: MVar CakeState -> IO a }
 
 data CakeState = CakeState
   { csRules :: [Rule],
-    csActs :: [Act ()]
+    csActs :: [Act ()],
+    csOracle :: Question -> IO (Maybe Answer)
   }
 
 instance Monad Cake where
@@ -358,7 +424,27 @@ checkQA env (Need entries) = do
     Left err -> return (QAFailure err)
  where
    check _goal new_time old_time = old_time == new_time
-   
+
+checkQA env (Oracle question old_answer) = do
+  mb_new_answer <- try (aeOracle env question)
+  report' env chatty $
+    "CHECKQA " ++ show (question, old_answer, mb_new_answer)
+  case mb_new_answer of
+    Right Nothing ->
+      -- Weird, the current oracle couldn't answer the old question.
+      -- Perhaps we updated the build file, so let's try to just
+      -- rebuild.  If we ask the same question again we'll get the
+      -- error during rebuilding.
+      return QARebuild
+
+    Right (Just new_answer) -> 
+      if new_answer /= old_answer then return QARebuild else return QAClean
+
+    Left err ->
+      return (QAFailure (WrappedException err))
+
+-- TODO: Example: We question the environment and a variable is no
+-- longer defined
 
 checkHistory :: ActEnv -> History -> IO CheckQAResult
 checkHistory env (H hist) = do 
@@ -415,8 +501,6 @@ checkOne env goal_ = do
           QARebuild ->
             runRule "history check failed, one or more dependencies changed"
                     unblock targets action
---          QAFailure errs -> do
---            let err = RecursiveError (map show outputs) (head errs)
           QAFailure err -> do
             modifyMVar_ (aeDatabase env) $ \db ->
               return $ updateStatus db (targets `zip` (repeat (Failed err)))
@@ -715,20 +799,26 @@ need goals = do
 
 -- | Run a 'Cake' monad.
 cake :: Cake () -> IO ()
-cake act = do
-  mst <- newMVar (CakeState{ csRules = [], csActs = [] })
-  unCake act mst
+cake collectRules = do
+  mst <- newMVar (CakeState{ csRules = []
+                           , csActs = []
+                           , csOracle = \_ -> return Nothing })
+  unCake collectRules mst
+
   st <- takeMVar mst
   let rules = reverse (csRules st)
       acts = reverse (csActs st)
+      oracle = csOracle st
   db <- loadDatabase databaseFilePath
   printDatabase db
   mdb <- newMVar db
   logLock <- newMVar ()
+  -- | TODO: Make customisable
   let poolSize = numCapabilities + 1
   withPool poolSize $ \pool -> do
     let env = ActEnv{ aeDatabase = mdb,
                       aeRules = reverse rules,
+                      aeOracle = oracle,
                       aePool = pool,
                       aeLogLock = logLock,
                       aeNestLevel = 0 }
@@ -787,3 +877,4 @@ handleIf :: Exception.Exception e =>
          -> IO a
 handleIf p handler act =
   Exception.handleJust (guard . p) (\() -> handler) act
+
