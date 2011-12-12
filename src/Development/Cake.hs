@@ -36,6 +36,8 @@ cat srcs dest = do
 copy :: FilePath
      -> FilePath
      -> Act ()
+copy from to
+ | from == to = return ()
 copy from to = do
   need [from]
   liftIO $ L.writeFile to =<< L.readFile from
