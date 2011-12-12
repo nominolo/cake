@@ -1,7 +1,7 @@
 module Development.Cake
   ( need, Core.cake, want, Cake, Act,
 
-    cat, (*>),
+    cat, (*>), copy,
 
     env
   )
@@ -14,6 +14,8 @@ import Development.Cake.Oracles.Env
 import Control.Concurrent ( threadDelay )
 import Control.Monad ( guard )
 import Control.Monad.IO.Class
+import Data.List ( nub )
+import System.Directory ( createDirectoryIfMissing )
 import System.Exit
 import System.FilePath
 import System.FilePath.Canonical
@@ -84,10 +86,12 @@ addRule rule = Core.addRule $ \cfp -> do
     Nothing -> return Nothing
     Just (creates, act) -> do
       creates_canon <- mapM canonical creates
-      return (Just Generates{ genOutputs = creates_canon
-                            , genAction = do
-                                act
-                                mapM getCleanModTime creates_canon })
+      return $ Just $
+        Generates{ genOutputs = creates_canon
+                 , genAction = do
+                     liftIO $ createDirectoriesForFiles creates_canon
+                     act
+                     mapM getCleanModTime creates_canon }
  where
    getCleanModTime :: CanonicalFilePath -> Act ModTime
    getCleanModTime cfp = do
@@ -97,6 +101,13 @@ addRule rule = Core.addRule $ \cfp -> do
        Nothing ->
          liftIO $ Core.cakeError $
            "Rule promised to create file, but didn't: " ++ show cfp
+
+-- | Recursively create any missing directories mentioned in the given
+-- files.
+createDirectoriesForFiles :: [CanonicalFilePath] -> IO ()
+createDirectoriesForFiles paths = do
+  let dirs = nub (map (takeDirectory . canonicalFilePath) paths)
+  mapM_ (createDirectoryIfMissing True) dirs
 
 -- TODO: Is 'String' the right type for arguments?  Can there be
 -- encoding issues?  Would ByteString be better.

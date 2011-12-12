@@ -1,0 +1,1 @@
+RUNHS=runghc
