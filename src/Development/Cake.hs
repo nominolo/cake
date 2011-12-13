@@ -1,29 +1,45 @@
 module Development.Cake
-  ( need, Core.cake, want, Cake, Act,
+  ( need, cake, want, Cake, Act,
 
     cat, (*>), copy,
 
-    env
+    env,
+
+    Core.cakeWithOptions
   )
 where
 
 import Development.Cake.Core ( Generates(..), Act, Cake, ModTime )
 import qualified Development.Cake.Core as Core
 import Development.Cake.Oracles.Env
+import Development.Cake.Options
 
 import Control.Concurrent ( threadDelay )
-import Control.Monad ( guard )
+import Control.Monad ( guard, when )
 import Control.Monad.IO.Class
-import Data.List ( nub )
+import Data.List ( nub, intercalate )
 import System.Directory ( createDirectoryIfMissing )
 import System.Exit
 import System.FilePath
 import System.FilePath.Canonical
 import System.Process hiding ( env )
+import System.Environment ( getArgs )
 import qualified Data.ByteString.Lazy as L
 import qualified System.FilePath.Glob as Glob
 
 import Debug.Trace
+
+cake :: Cake () -> IO ()
+cake collectRules = do
+  args <- getArgs
+  let (opts, unparsed, warns) = parseOptions args defaultOptions
+
+  when (not (null warns)) $ do
+    mapM_ (putStrLn . ("Warning: " ++)) warns
+  when (not (null unparsed)) $ do
+    putStrLn $ "Ignoring unknown arguments: " ++ intercalate " " unparsed
+
+  Core.cakeWithOptions opts collectRules
 
 -- | Concatenate the contents of the source files and write the result
 -- into the destination file.

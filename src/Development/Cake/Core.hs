@@ -4,6 +4,7 @@
 module Development.Cake.Core where
 
 import Development.Cake.Core.Types
+import Development.Cake.Options
 
 import Control.Applicative
 import Control.Concurrent.MVar
@@ -141,6 +142,7 @@ data ActEnv = ActEnv
     -- characters might be interleaved when using 'putStrLn'.  Use
     -- 'report' instead.
   , aeNestLevel :: Int
+  , aeVerbosity :: Verbosity
   }
 
 report :: Verbosity -> String -> Act ()
@@ -149,6 +151,8 @@ report verb msg = do
   liftIO $ report' env verb msg
 
 report' :: ActEnv -> Verbosity -> String -> IO ()
+report' env verb _msg
+  | verb > aeVerbosity env = return ()
 report' env _verb msg =
   withMVar (aeLogLock env) $ \() -> do
     let indentStr = replicate (2 * (aeNestLevel env)) ' '
@@ -791,9 +795,8 @@ need goals = do
     Left err ->
       liftIO $ throwIO err
 
--- | Run a 'Cake' monad.
-cake :: Cake () -> IO ()
-cake collectRules = do
+cakeWithOptions :: Options -> Cake () -> IO ()
+cakeWithOptions opts collectRules = do
   mst <- newMVar (CakeState{ csRules = []
                            , csActs = []
                            , csOracle = \_ -> return Nothing })
@@ -815,7 +818,10 @@ cake collectRules = do
                       aeOracle = oracle,
                       aePool = pool,
                       aeLogLock = logLock,
-                      aeNestLevel = 0 }
+                      aeNestLevel = 0,
+                      aeVerbosity = optionVerbosity opts
+                    }
+
     -- This is where we kick off the actual work
     parallel_ pool $ map (runAct env) acts
     report' env chatty $ "Writing database"
