@@ -807,7 +807,6 @@ cakeWithOptions opts collectRules = do
       acts = reverse (csActs st)
       oracle = csOracle st
   db <- loadDatabase databaseFilePath
-  printDatabase db
   mdb <- newMVar db
   logLock <- newMVar ()
   -- | TODO: Make customisable
@@ -826,7 +825,6 @@ cakeWithOptions opts collectRules = do
     parallel_ pool $ map (runAct env) acts
     report' env chatty $ "Writing database"
     db' <- takeMVar mdb
-    printDatabase db'
     writeDatabase databaseFilePath db'
   return ()
 
