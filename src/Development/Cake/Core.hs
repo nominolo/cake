@@ -3,6 +3,8 @@
 {-# OPTIONS_GHC -Wall -fno-warn-orphans #-}
 module Development.Cake.Core where
 
+import Development.Cake.Core.Types
+
 import Control.Applicative
 import Control.Concurrent.MVar
 import Control.DeepSeq
@@ -135,19 +137,11 @@ data ActEnv = ActEnv
   , aeOracle :: Question -> IO (Maybe Answer)
   , aePool :: Pool
   , aeLogLock :: MVar ()
-  , aeNestLevel :: Int
     -- ^ Lock for printing messages.  Without the lock, single
     -- characters might be interleaved when using 'putStrLn'.  Use
     -- 'report' instead.
+  , aeNestLevel :: Int
   }
-
-newtype Verbosity = V Int
-
-chatty :: Verbosity
-chatty = V 4
-
-silent :: Verbosity
-silent = V 0
 
 report :: Verbosity -> String -> Act ()
 report verb msg = do
@@ -877,4 +871,3 @@ handleIf :: Exception.Exception e =>
          -> IO a
 handleIf p handler act =
   Exception.handleJust (guard . p) (\() -> handler) act
-
