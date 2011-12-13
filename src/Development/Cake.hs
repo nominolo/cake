@@ -62,7 +62,7 @@ type Pattern = String
   pwd <- liftIO (canonical ".")
   addRule $ \fp -> do
     let relfp = makeRelative (canonicalFilePath pwd) fp
-    let matchp = (Glob.match compiled relfp)
+    let matchp = Glob.match compiled relfp
     guard matchp --(trace ("matchp, fp: " ++ show (matchp, fp, pattern)) matchp)
     return ([fp], action fp)
  where compiled = Glob.compile pattern
@@ -123,6 +123,3 @@ system cmd args = do
 
 system' :: String -> [String] -> Act ExitCode
 system' cmd args = liftIO $ rawSystem cmd args
-
---ignoreErrors :: Act a -> Act ()
---ignoreErrors act = error "NYI"
