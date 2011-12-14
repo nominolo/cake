@@ -4,7 +4,6 @@ ROOT=../..
 
 .PHONY: test
 test:
-	@echo "Hello"
 	echo "foo" > A.txt
 	$(RUNHS) -i$(ROOT)/src cakefile.hs
 	diff -u A.txt build/A.txt
@@ -13,5 +12,5 @@ test:
 	echo "bar" >> A.txt
 	$(RUNHS) -i$(ROOT)/src cakefile.hs
 	diff -u A.txt build/A.txt
-	rm A.txt build/A.txt
+	rm A.txt build/A.txt .cake-db
 	rm -r build
