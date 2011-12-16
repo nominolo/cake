@@ -1,0 +1,6 @@
+cakefile.hs: The following dependency failed to build: 
+  AB.txt:
+    The following dependency failed to build: 
+      B.txt:
+        Error in rule definition: No rule to build B.txt
+
